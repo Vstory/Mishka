@@ -7,6 +7,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"unsafe"
+
 	"github.com/metacubex/mihomo/component/age"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
@@ -25,10 +27,10 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-//export mihomoEntry
-//
 // dlopen + dlsym 进入点：解析 -d / -f / --override-json / --secret / --ext-ctl，启动 hub 后阻塞等信号。
 // argv[0] 透传 binary 路径作占位；返回值即进程退出码。
+//
+//export mihomoEntry
 func mihomoEntry(argc C.int, argv **C.char) C.int {
 	args := make([]string, int(argc))
 	if argc > 0 && argv != nil {
@@ -45,14 +47,14 @@ func runMihomo() int {
 	// 独立 FlagSet 避开 mishka_core 其他文件可能注册到 flag.CommandLine 的 flag。
 	fs := flag.NewFlagSet("mihomo", flag.ExitOnError)
 	var (
-		homeDir            string
-		configFile         string
-		secret             string
-		externalController string
-		overrideJSON       string
-		transformPath      string
+		homeDir             string
+		configFile          string
+		secret              string
+		externalController  string
+		overrideJSON        string
+		transformPath       string
 		preferTransformPort bool
-		ageSecretKey       string
+		ageSecretKey        string
 	)
 	fs.StringVar(&homeDir, "d", "", "set configuration directory")
 	fs.StringVar(&configFile, "f", "", "specify configuration file")
@@ -133,6 +135,18 @@ func runMihomo() int {
 			}
 		}
 	}
+	// 最终 YAML（含脚本变换）和用户覆写都未选栈时，才覆盖 mihomo 内建默认值。
+	defaultStack, err := shouldDefaultTunStack(configBytes, overrideJSON, ageSecretKey)
+	if err != nil {
+		log.Fatalln("inspect tun stack: %s", err.Error())
+	}
+	if defaultStack {
+		options = append(options, func(cfg *config.Config) {
+			if cfg.General.Tun.Enable {
+				cfg.General.Tun.Stack = Const.TunMips
+			}
+		})
+	}
 
 	if err := hub.Parse(configBytes, options...); err != nil {
 		log.Fatalln("Parse config: %s", err.Error())
@@ -159,6 +173,42 @@ func runMihomo() int {
 			}
 		}
 	}
+}
+
+func shouldDefaultTunStack(configBytes []byte, overrideJSON, ageSecretKey string) (bool, error) {
+	plain, err := decryptConfig(configBytes, ageSecretKey)
+	if err != nil {
+		return false, err
+	}
+	var subscription struct {
+		Tun struct {
+			Stack *string `yaml:"stack"`
+		} `yaml:"tun"`
+	}
+	if err := yaml.Unmarshal(plain, &subscription); err != nil {
+		return false, err
+	}
+	if subscription.Tun.Stack != nil {
+		return false, nil
+	}
+	if overrideJSON != "" {
+		data, err := os.ReadFile(overrideJSON)
+		if err != nil {
+			return false, err
+		}
+		var user struct {
+			Tun struct {
+				Stack *string `json:"stack"`
+			} `json:"tun"`
+		}
+		if err := json.Unmarshal(data, &user); err != nil {
+			return false, err
+		}
+		if user.Tun.Stack != nil {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func transformedMixedPort(configBytes []byte) (int, error) {

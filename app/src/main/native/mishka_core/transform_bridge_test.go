@@ -15,7 +15,7 @@ func TestTransformedMixedPortUsesScriptResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	scriptPath := filepath.Join(workDir, "port.js")
-	if err := os.WriteFile(scriptPath, []byte(`function main(c) { c["mixed-port"] = 7895; return c; }`), 0600); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(`function main(c) { c["mixed-port"] = 7895; c.tun = {stack: "system"}; return c; }`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	transformPath := filepath.Join(workDir, "transform.json")
@@ -36,5 +36,12 @@ func TestTransformedMixedPortUsesScriptResult(t *testing.T) {
 	}
 	if port != 7895 {
 		t.Fatalf("transformed mixed-port = %d, want 7895", port)
+	}
+	defaultStack, err := shouldDefaultTunStack(out, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultStack {
+		t.Fatal("transformed subscription's explicit stack was ignored")
 	}
 }
