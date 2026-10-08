@@ -40,6 +40,10 @@ room3 {
 // 每次求值都 fork 一个 git 进程，且 versionCode 与 archivesName 都要用，求值一次共用
 val gitVersionCode = getGitVersionCode()
 
+// CI 渠道（build-ci.yml）传 `-PciVersionSuffix=ci-<变体>.<短号>`：同一 versionCode 会被连续构建多次，
+// 在系统应用信息页里完全同形、认不出是哪次提交。`+` 之后属 semver 的构建元数据段，不参与版本比较。
+val ciVersionSuffix = providers.gradleProperty("ciVersionSuffix").orNull?.trim()?.takeIf { it.isNotEmpty() }
+
 val properties = Properties()
 runCatching { project.rootProject.file("local.properties").inputStream().use { properties.load(it) } }
 val keystorePath: String? = properties.getProperty("KEYSTORE_PATH") ?: System.getenv("KEYSTORE_PATH")
@@ -88,6 +92,9 @@ android {
         minSdk = ProjectConfig.Android.MIN_SDK
         targetSdk = ProjectConfig.Android.TARGET_SDK
         versionName = ProjectConfig.VERSION_NAME
+        // 后赋值覆盖，而不是改写上面的字面量：CI 工作流用 sed 从 ProjectConfig.kt 取 versionName，
+        // 它是产物名与滚动页版本列的唯一来源，必须保持可解析的字面量
+        ciVersionSuffix?.let { versionName = "${ProjectConfig.VERSION_NAME}+$it" }
         versionCode = gitVersionCode
     }
     dependenciesInfo {

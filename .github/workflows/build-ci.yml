@@ -1,0 +1,516 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# CI 滚动发布：任意分支 push 即出包，发进固定 tag 的同一个滚动页。
+#   母版：知识库 100_System/templates/build-ci.workflow.yml（规程：GitHub域/CI滚动发布页流程.md）
+#   ⚠️ 本项目（Mishka = mihomo GUI，**非 LSPosed 模块**）对母版有三处裁剪，同步母版更新时注意保留：
+#     ① 构建环境：多了 Go 工具链 + 子模块（mihomo / scripta）+ 先跑 downloadGeoFiles
+#     ② 版本号解析：versionName 在 buildSrc 常量里、versionCode 是 git 提交数（不是 versionName= 字面量）
+#     ③ 产物门禁：去掉 libxposed 三件套那几条，改查包名 / ABI / 核心 so / 签名
+# ══════════════════════════════════════════════════════════════════════════════
+name: Build · CI
+
+# 任意分支 push 都出包（默认只出 debug 变体），发进固定 tag 的**同一个滚动页**，
+# 产物按时间戳追加、页面永不新增。分支本来就是用来试的 ⇒ 每次提交都该能立刻拿到包。
+# 多分支并发共用这一页（不设并发锁）—— 页面只有一张表，每个包一行，不按分支分页。
+run-name: "Build · CI · ${{ github.ref_name }}"
+
+on:
+  push:
+    # ⚠️ 必须显式写 branches：只写 paths-ignore 时**标签推送也会触发**（发版工作流建的 tag
+    #   会反手把 CI 跑一遍）。`[ '**' ]` 只匹配分支，恰好把标签挡在外面。
+    branches: ['**']
+    paths-ignore:            # ← 按项目改：纯文档/数据文件改动不必出包
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: '构建变体（push 触发时用 PUSH_VARIANT）'
+        type: choice
+        options:
+          - debug
+          - release
+          - both
+        default: both
+        required: true
+
+# 并发：**不设并发锁** —— 每次 push 都独立出包，任意分支、任意次数都同时构建（要的是
+#   「推了就有包」；排队等前一次跑完、或同分支新推取消旧跑，都会让人拿不到自己那次的产物）。
+# 页面写入的并发安全因此不靠串行，改由三件事共同保证（见 Publish / Refresh 两步）：
+#   幂等创建 + 资产名天然唯一 + 正文全量重建。任何交错都收敛到同一稳态（页面 = 最新 N 组）。
+
+permissions:
+  contents: write   # 发布 Release 需要写权限
+
+env:
+  # ════════════════════════ PROJECT-CUSTOM-BEGIN ════════════════════════
+  # 产物名前缀 = 应用英文名（与包名末段一致）。进文件名与下载 URL ⇒ 只允许 A-Za-z0-9._-
+  #   （中文应用名进不了文件名/URL；括号在 URL 里需转义，一律用 `-`/`.`，名里不得出现括号）
+  PREFIX: Mishka
+  # 版本号来源文件：Mishka 的 versionName 是 buildSrc 里的常量（sed 取第一处 VERSION_NAME），
+  # versionCode 由 git 提交数生成 ⇒ 解析方式见 Resolve APK name 步骤
+  VERSION_FILE: buildSrc/src/main/kotlin/ProjectConfig.kt
+  # 滚动页：固定 tag + 页面标题 + 保留组数
+  CI_TAG: ci
+  CI_TITLE: CI Build
+  KEEP_GROUPS: '6'
+  # 页面刷新器（项目内副本；母版：知识库 100_System/templates/refresh_ci_page.sh）
+  REFRESH_SCRIPT: scripts/ci-refresh-page.sh
+  # 构建环境（Go 版本由 core 的 go.mod 决定，见 Set up Go）
+  JAVA_VERSION: '21'
+  # compileSdk 37 + minorApiLevel 2 ⇒ 平台包名必须带 minor（AGP 按这个名字去找目录）
+  ANDROID_PLATFORM: android-37.2
+  BUILD_TOOLS: 37.0.0
+  # 产物门禁：包名 / ABI / 固定密钥的证书指纹（SHA-256 大写无冒号，取法 keytool -list -v）
+  EXPECT_PACKAGE: top.yukonga.mishka
+  EXPECT_ABI: arm64-v8a
+  EXPECTED_CERT_SHA256: '8D1B6022D3E3BB837A3BA1870E0EEAC8650F9470B8287EDF549DACEC9E9E2A64'
+  # abi splits 已开、isUniversalApk=false ⇒ 产物名带 ABI 段（见 app/build.gradle.kts）
+  APK_OUT_DEBUG: app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
+  APK_OUT_RELEASE: app/build/outputs/apk/release/app-arm64-v8a-release.apk
+  # push 触发时构建哪些变体（本项目要现编 Go 核心，单变体已数十分钟 ⇒ 默认只出 debug）
+  PUSH_VARIANT: debug
+  # 源码层静态检查（scripts/check_string_format_args.py，母版已随脚手架复制进项目）
+  #   项目自有「取资源」包装函数，空格分隔（例：UiText.Res）；Mishka 全用 Compose 的
+  #   stringResource（在母版默认白名单里），无需追加
+  STR_RES_CALLS: ''
+  # 项目已做字符串资源化（res/values*）⇒ 资源表或脚本消失时不许静默跳过
+  STR_STRICT: '1'
+  # ═════════════════════════ PROJECT-CUSTOM-END ═════════════════════════
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    env:
+      # checkout 内部的 `git init` 会为默认分支名打十几行 hint（那个空仓库随即被覆盖，分支名
+      #   不参与构建）。写 ~/.gitconfig 压不住 —— checkout 期间会临时改写 HOME；环境变量等同
+      #   命令行 -c，优先级高于 global。
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: init.defaultBranch
+      GIT_CONFIG_VALUE_0: main
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # 完整历史是硬需求：versionCode = `git rev-list --count HEAD`，浅克隆会静默掉到兜底值 1
+          fetch-depth: 0
+          # mihomo（Go 核心源码）+ scripta（settings.gradle.kts 的 includeBuild）缺一即编不出来
+          submodules: recursive
+
+      # 源码层静态检查（秒级）刻意排在**编译之前**：这类错编译期看不见（取值函数的实参是
+      #   `Any`，类型与个数都不查）、单测也看不见（无 Android 资源表），只在真机点进那一屏时
+      #   抛 IllegalFormatConversionException。早失败能省下几分钟构建。
+      #   脚本由脚手架复制进项目（母版：100_System/templates/check_string_format_args.py）。
+      - name: Static check (string format args)
+        run: |
+          set -euo pipefail
+          SCRIPT=scripts/check_string_format_args.py
+          if [ ! -f "$SCRIPT" ]; then
+            # 老项目可能还没接这道检查 ⇒ 跳过；但项目既然声明了 STR_STRICT（= 它确实在做
+            #   字符串资源化，这道检查本该常驻），脚本消失就只能是误删/改名 ⇒ 不许静默放行。
+            if [ -n "${STR_STRICT:-}" ]; then
+              echo "::error::未找到 $SCRIPT（项目已声明 STR_STRICT）—— 视为误删/改名，拒绝静默跳过"
+              exit 1
+            fi
+            echo "::notice::未找到 $SCRIPT（母版：100_System/templates/check_string_format_args.py）—— 跳过"
+            exit 0
+          fi
+          # shellcheck disable=SC2086  # STR_RES_CALLS 故意不加引号：按空格拆成多个函数名
+          CALL_ARGS=()
+          for c in ${STR_RES_CALLS:-}; do CALL_ARGS+=(--call "$c"); done
+          python3 "$SCRIPT" ${STR_STRICT:+--strict} "${CALL_ARGS[@]}" .
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # Go 核心（libmihomo.so）由 buildSrc 的 GoBuildTask 在 preBuild 阶段现编，故 CI 必须有 Go。
+      #   go.sum 不在仓库根，缓存键默认会去找根目录的 go.sum ⇒ 不指到实际编译的模块上就是每次
+      #   miss、全量重下 mihomo 的依赖树（Go 与 NDK 工具链的版本由 go.mod / AGP 决定，不额外钉）。
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: app/src/main/native/mishka_core/go.mod
+          cache-dependency-path: app/src/main/native/mishka_core/go.sum
+
+      # Android SDK：项目要求的具体 platform / build-tools 常不在 runner 镜像里，显式装 + 断言。
+      #   ⚠️ 自 API 37 起平台包名带 minor：本项目 compileSdk 的 minorApiLevel=2 ⇒ AGP 只认
+      #   platforms/android-37.2（改成 android-37 反而找不到；不设 minor 时 AGP 只认 android-37，
+      #   SDK 里不存在这个名字）。
+      - name: Set up Android SDK
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+          echo "SDK=$SDK"
+          echo "sdkmanager=$SDKM"
+
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          for pkg in "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}"; do
+            "$SDKM" "$pkg" >/dev/null 2>&1 || sudo "$SDKM" "$pkg" >/dev/null 2>&1 \
+              || echo "::warning::$pkg 安装返回非零"
+          done
+
+          # 断言：缺一即在此失败，不留到 Gradle 报含糊错
+          test -f "$SDK/platforms/${ANDROID_PLATFORM}/android.jar" \
+            || { echo "::error::platforms/${ANDROID_PLATFORM} 未就位（AGP 侧 minorApiLevel 要的就是这个名字）"
+                 "$SDKM" --list 2>/dev/null | grep -i "${ANDROID_PLATFORM%%.*}" || true; exit 1; }
+          test -x "$SDK/build-tools/${BUILD_TOOLS}/aapt2" \
+            || { echo "::error::build-tools ${BUILD_TOOLS} 就位失败"; exit 1; }
+          echo "platforms: $(ls "$SDK/platforms" | tr '\n' ' ')"
+          echo "build-tools: $(ls "$SDK/build-tools" | tr '\n' ' ')"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Compute build info
+        id: info
+        run: |
+          echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "ts=$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      # tag / 页面名 / **产物名** 集中在这里：产物名被三处引用（重命名 / 正文表格 / 清理正则），
+      #   任一处漏改都是静默错（下载 404、历史列表整段消失、旧资产永不清理）⇒ 只能有一个来源。
+      #   也刻意放在编译之前 —— 解析失败只花几秒。
+      #
+      # 命名：<前缀>_<版本>.<code>_<时间>_ci-<变体>_<短号>.apk
+      #   · 渠道段 `ci-debug` / `ci-release`：下载到手一眼看出不是正式包。
+      #   · 前缀与包名一致（应用名是中文，进不了文件名/URL）。
+      #   · ⚠️ 前缀两处同源，改名必须同改：本处与发版工作流的 PREFIX
+      #       —— 两处不一致会让同一版本的两个渠道产物名不同源，混在一起分不清。
+      - name: Resolve APK name
+        id: target
+        env:
+          TS: ${{ steps.info.outputs.ts }}
+          SHORT: ${{ steps.info.outputs.short }}
+          WANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          VER="$(sed -nE 's/^[[:space:]]*const val VERSION_NAME = "([^"]+)".*/\1/p' "$VERSION_FILE" | head -1)"
+          # versionCode 是**提交数**（buildSrc/getGitVersionCode），不是文件里的字面量 ⇒ 这里现算一次，
+          # 与构建同源（checkout 的 fetch-depth: 0 保证计数完整，浅克隆会算出兜底值 1）
+          CODE="$(git rev-list --count HEAD)"
+          if [ -z "$VER" ] || [ -z "$CODE" ]; then
+            echo "::error::读不到 versionName（$VERSION_FILE）/ versionCode（git rev-list --count HEAD）"
+            exit 1
+          fi
+          # 版本名可能带空格（如 "2.2.0 Dev 9"），而文件名不允许空格 —— 去掉全部空白
+          VER="$(printf '%s' "$VER" | tr -d '[:space:]')"
+          case "$VER" in
+            ""|*[!A-Za-z0-9._-]*) echo "::error::版本名去空格后仍含非法字符：'$VER'"; exit 1 ;;
+          esac
+
+          # 变体集合。push 事件没有 inputs ⇒ WANT 为空，回落到 PUSH_VARIANT
+          case "${WANT:-$PUSH_VARIANT}" in
+            debug|release) VLIST="${WANT:-$PUSH_VARIANT}" ;;
+            both)          VLIST="debug release" ;;
+            *) echo "::error::非法变体：${WANT}"; exit 1 ;;
+          esac
+
+          {
+            echo "tag=${CI_TAG}"
+            echo "name=${CI_TITLE}"
+            echo "prerelease=true"
+            echo "make_latest=false"
+            echo "variants=${VLIST}"
+            echo "variant_tag=$(printf '%s' "$VLIST" | tr ' ' '-')"
+          } >> "$GITHUB_OUTPUT"
+          for kv in "VER=$VER" "CODE=$CODE" "VARIANT_LIST=$VLIST" "SHORT=$SHORT"; do echo "${kv}" >> "$GITHUB_ENV"; done
+
+          for v in $VLIST; do
+            N="${PREFIX}_${VER}.${CODE}_${TS}_ci-${v}_${SHORT}.apk"
+            echo "APKNAME_$(printf '%s' "$v" | tr '[:lower:]' '[:upper:]')=${N}" >> "$GITHUB_ENV"
+            echo "产物名（${v}）：${N}"
+          done
+
+      # 签名：从仓库 secrets 解码**固定密钥**（各项目共用同一把，见 tokens/Signing/）。
+      #   ⚠️ 4 个 secret 名是配套的一组，改名要同改：本处、发版工作流、
+      #      tokens/Signing/scripts/sync-signing-secrets.py、tokens/Signing/README.md。
+      #   ⚠️ secret 一律经 env 传入、run 里只引用变量名 —— 不把 ${{ secrets.X }} 写进 run 正文：
+      #      值里若含 `$` 或反引号会被 shell 二次展开，且在签名报错前毫无提示。
+      #   ⚠️ 缺 secret 时**直接失败**：不回退 debug 签名 —— 「构建成功、签名不对」要等覆盖安装
+      #      时才发现（覆盖安装会因签名不同而失败，甚至丢掉模块的作用域状态）。
+      - name: Prepare signing (fixed key from secrets)
+        env:
+          KEY_BASE64: ${{ secrets.KEY_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in KEY_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 secret:$missing —— 拒绝回退（那会让产物无法覆盖升级）"
+            exit 1
+          fi
+
+          KS="$GITHUB_WORKSPACE/ci-signing.jks"
+          printf '%s' "$KEY_BASE64" | base64 -d > "$KS"
+
+          # 就地自检：解出的库能否用该口令打开、别名是否存在。否则「KEY_BASE64 其实是另一个库 /
+          #   口令与 secret 不一致」会拖到 AGP 签名阶段才报错，且信息含糊。
+          keytool -list -keystore "$KS" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null 2>&1 \
+            || { echo "::error::密钥库打不开或别名不存在 —— 核对 KEY_BASE64 / SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS"; exit 1; }
+          echo "已校验：密钥库可打开、别名存在"
+
+          # 口令走文件传递，避开 shell 二次展开；storeFile 现场拼绝对路径，不写死 runner 上的布局。
+          # ⚠️ 键名是 Mishka 侧的口径（app/build.gradle.kts 读 KEYSTORE_PATH/KEYSTORE_PASS/KEY_ALIAS/
+          #    KEY_PASSWORD），不是 AGP 的 storeFile/storePassword —— 写错等于没配签名，而产物照样出得来。
+          {
+            printf 'KEYSTORE_PATH=%s\n' "$KS"
+            printf 'KEYSTORE_PASS=%s\n' "$STORE_PASSWORD"
+            printf 'KEY_ALIAS=%s\n' "$KEY_ALIAS"
+            printf 'KEY_PASSWORD=%s\n' "$KEY_PASSWORD"
+          } >> local.properties
+          echo "已按固定密钥配置签名"
+
+      # 每个变体单独调用 gradle ⇒ 可分别注入构建元数据段。versionName 是 defaultConfig 级的、
+      #   无法按变体区分，故项目侧 build.gradle.kts 需读取该属性覆盖 versionName：
+      #     -PciVersionSuffix="ci-<变体>.<短号>"  ⇒  versionName = "<版本>+ci-<变体>.<短号>"
+      #   （`+` 之后是 semver 的构建元数据段，不参与版本比较；只影响应用内显示，不影响产物名与
+      #     versionCode。同一 versionCode 的多次构建靠它区分，否则在系统应用信息页完全同形。）
+      #   ⚠️ 覆盖赋值必须写在 versionName 那行**之后** —— 发版/CI 工作流都用 sed 取**第一处**。
+      - name: Gradle build
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          # GeoIP/GeoSite 数据文件不入库（.gitignore 排除），且刻意没挂进 assemble ⇒ 必须先显式取一次；
+          # 该任务自带超时与体积下限校验，抓到错误页会直接失败而不是把 HTML 当数据打进包里
+          ./gradlew --no-daemon :app:downloadGeoFiles
+          # libmihomo.so（Go 核心）由 preBuild 依赖的 GoBuildTask 现编，CMake 再链它
+          for v in $VARIANT_LIST; do
+            case "$v" in
+              debug)   ./gradlew --no-daemon :app:assembleDebug   -PciVersionSuffix="ci-debug.${SHORT}" ;;
+              release) ./gradlew --no-daemon :app:assembleRelease -PciVersionSuffix="ci-release.${SHORT}" ;;
+            esac
+          done
+          ls -la app/build/outputs/apk/*/ || true
+
+      # 只落盘 + 自检：产物名由 Resolve APK name 算出（命名规则的唯一来源）。
+      - name: Rename APK and assert naming rule
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for v in $VARIANT_LIST; do
+            case "$v" in
+              debug)   SRC="$APK_OUT_DEBUG" ;;
+              release) SRC="$APK_OUT_RELEASE" ;;
+            esac
+            if [ ! -f "$SRC" ]; then
+              # release 在签名配置缺失时 AGP 会产 app-release-unsigned.apk（装不上）——
+              #   这是最该拦下的静默失败，单独认出来报，别只报「未找到产物」
+              if [ -f "${APK_OUT_RELEASE%/*}/app-release-unsigned.apk" ]; then
+                echo "::error::release 产物未签名（出现 app-release-unsigned.apk）—— signingConfig 没生效"
+                exit 1
+              fi
+              echo "::error::未找到产物：$SRC"; exit 1
+            fi
+            var="APKNAME_$(printf '%s' "$v" | tr '[:lower:]' '[:upper:]')"
+            cp -- "$SRC" "dist/${!var}"
+            echo "产物: dist/${!var} ← $SRC"
+          done
+
+          # 命名自检（拿**实际产出的文件名**校验，不只信规则自洽）
+          # ⚠️ 与 refresh_ci_page.sh 的 NAME_RE 同源，改命名规则必须两处同改
+          RE='^[A-Za-z0-9._-]+_[0-9]{8}-[0-9]{4}_ci-(debug|release)_[0-9a-f]{8}\.apk$'
+          shopt -s nullglob
+          apks=(dist/*.apk)
+          want=$(wc -w <<< "$VARIANT_LIST")
+          [ "${#apks[@]}" -eq "$want" ] || { echo "::error::应产出 $want 个包，实际 ${#apks[@]} 个"; exit 1; }
+          for f in "${apks[@]}"; do
+            printf '%s' "$(basename "$f")" | grep -qE "$RE" \
+              || { echo "::error::产物名与规则不符（或含空格/括号/百分号等 URL 不友好字符）: $(basename "$f")"; exit 1; }
+          done
+          echo "✅ 命名自检通过"
+          ls -la dist
+
+      # 断言产物真的可用：包名 / 版本号 / 变体 / 单 ABI / 核心 so / 真的被固定密钥签过。全是**静默失败
+      #   模式**（包照样装、照样跑，只是核心库缺失或签名不对），故必须做成门禁而不是「发布前看一眼」。
+      #   ⚠️ 与母版（LSPosed 模块）的差异：本项目不是模块 —— 没有 META-INF/xposed 三件套与
+      #      scope.list，也不靠 java_init.list 反射加载入口类，那几条断言在此无处安放，换成下面这几条。
+      - name: Verify APK (package + variant + abi + core so + signature)
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(command -v apksigner || true)"
+          [ -n "$APKSIGNER" ] || APKSIGNER="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+          [ -n "$APKSIGNER" ] || { echo "::error::找不到 apksigner，无法断言签名 —— 拒绝发布"; exit 1; }
+          AAPT2="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+          [ -n "$AAPT2" ] || { echo "::error::找不到 aapt2（用于读版本与 debuggable 标志）"; exit 1; }
+
+          # 每个产物独立跑全套断言。变体从**文件名**反推（命名规则保证含 `_ci-<变体>_`），
+          #   不依赖构建期变量 ⇒「名字里写的变体」与「包里实际的变体」必须自洽，否则当场红。
+          for APK in dist/*.apk; do
+            NAME="$(basename "$APK")"
+            case "$NAME" in
+              *_ci-debug_*.apk)   VAR=debug ;;
+              *_ci-release_*.apk) VAR=release ;;
+              *) echo "::error::$NAME 无法从文件名判定变体"; exit 1 ;;
+            esac
+            echo "════ 校验 $NAME（$VAR）"
+
+            # ⚠️ 下面每个 `VAR="$(... | grep ...)"` 都带 `|| true`：grep 无匹配时返回 1，在 `bash -e`
+            #    下会让赋值语句整体失败 ⇒ 脚本**静默**退出（日志里只剩 "Process completed with
+            #    exit code 1."，看不出是哪条断言挂了）。故一律「先抓、再显式判空报错」。
+            BADGING="$("$AAPT2" dump badging "$APK" 2>/dev/null || true)"
+            PKG_LINE="$(printf '%s' "$BADGING" | grep -m1 "^package:" || true)"
+            [ -n "$PKG_LINE" ] || { echo "::error::$NAME 读不到 badging 的 package 行"; exit 1; }
+
+            # ① 包名（fork 若被改了 applicationId，产物装上去是另一个应用，覆盖安装直接失败）
+            printf '%s' "$PKG_LINE" | grep -Fq "name='${EXPECT_PACKAGE}'" \
+              || { echo "::error::$NAME 包名不是 ${EXPECT_PACKAGE}：$PKG_LINE"; exit 1; }
+            echo "  ✅ 包名：${EXPECT_PACKAGE}"
+
+            # ② 单 ABI：abi splits 只出 arm64-v8a 且 isUniversalApk=false ⇒ 出现别的 ABI 说明配置被改
+            NC="$(printf '%s' "$BADGING" | grep -m1 "^native-code:" || true)"
+            [ "$NC" = "native-code: '${EXPECT_ABI}'" ] \
+              || { echo "::error::$NAME 的 native-code 不是单一 ${EXPECT_ABI}：${NC:-未读到}"; exit 1; }
+            echo "  ✅ 单 ABI：${EXPECT_ABI}"
+
+            # ③ 核心 so 必须真在包里：libmihomo.so 是 Go 现编的 mihomo 运行时，缺了它应用照样装得上、
+            #    启动后代理不可用；另三个是同一条链上的桥（runner / jni / mishka）。
+            for so in libmihomo.so libmihomo_runner.so libmishka_jni.so libmishka.so; do
+              unzip -l "$APK" | grep -q "lib/${EXPECT_ABI}/${so}$" \
+                || { echo "::error::$NAME 缺 lib/${EXPECT_ABI}/${so}（核心库没打进包）"; exit 1; }
+            done
+            echo "  ✅ 核心 so 齐全"
+
+            # ④ 版本号必须与源码一致：CI 渠道额外带 `+ci-<变体>.<短号>` 构建元数据段
+            printf '%s' "$PKG_LINE" | grep -q "versionCode='${CODE}'" \
+              || { echo "::error::$NAME 的 versionCode 与源码不符（期望 ${CODE}）：$PKG_LINE"; exit 1; }
+            # 用 -F：期望串含 `+` 与 `.`，走正则会被当元字符
+            printf '%s' "$PKG_LINE" | grep -Fq "versionName='${EXPECT_VN}'" \
+              || { echo "::error::$NAME 的 versionName 与源码不符（期望 ${EXPECT_VN}）：$PKG_LINE"; exit 1; }
+            echo "  ✅ 版本号与源码一致：${EXPECT_VN}(${CODE})"
+
+            # ⑤ debuggable 标志必须与文件名里的变体一致 —— 两个方向都要查：
+            #    release 带它 = 日志没裁（非最终形态）；debug 没它 = 排障日志全丢。都是实际错。
+            DBG="$(printf '%s' "$BADGING" | grep -c "^application-debuggable$" || true)"
+            if [ "$VAR" = debug ]; then
+              [ "$DBG" -ge 1 ] || { echo "::error::$NAME 名为 debug 但 badging 无 application-debuggable —— 确认构建用的是 assembleDebug"; exit 1; }
+              echo "  ✅ debug 变体（application-debuggable）"
+            else
+              [ "$DBG" -eq 0 ] || { echo "::error::$NAME 名为 release 但 badging 含 application-debuggable —— 确认构建用的是 assembleRelease"; exit 1; }
+              echo "  ✅ release 变体（非 debuggable）"
+            fi
+
+            # ⑥ 签名有效 + 指纹等于固定密钥
+            OUT="$("$APKSIGNER" verify --print-certs "$APK" 2>&1 || true)"
+            if printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|Missing.*signature\|no signature'; then
+              echo "::error::$NAME 未通过签名校验 —— 拒绝发布"
+              printf '%s\n' "$OUT"
+              exit 1
+            fi
+            # 指纹行格式随 build-tools 版本变化（V2 Signer / V3.0 Signer / Signer #1 …），三种都认；
+            #   上面各行的证书是同一把，故取哪一行都对。
+            DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^.*certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' | head -1)"
+            [ -n "$DIGEST" ] || { echo "::error::$NAME 读不到签名证书指纹（apksigner 未能解析产物）"; printf '%s\n' "$OUT"; exit 1; }
+            ACTUAL="$(printf '%s' "$DIGEST" | tr -d ':' | tr 'a-f' 'A-F')"
+            if [ "$ACTUAL" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::$NAME 签名指纹与固定密钥不符 —— 拒绝发布（多半是 secrets 没配好，产物用了 debug 签名）"
+              echo "  期望: $EXPECTED_CERT_SHA256"
+              echo "  实际: $ACTUAL"
+              exit 1
+            fi
+            echo "  ✅ 签名有效，指纹与固定密钥一致：$ACTUAL"
+
+            # ⑦ 签名方案：v2 与 v3 都必须在（两个变体共用同一签名配置）。
+            #    ⚠️ 必须带 --min-sdk-version 24：verify 默认按 manifest 的 minSdk 判定，而
+            #       minSdk ≥ 28 时 apksig 视 v2 为冗余、**跳过其验证与上报** ⇒ 报 "v2: false"。
+            #       那是上报语义而非块缺失（实测产物 Signing Block 内 v2 块确实存在，只是没被
+            #       列出来）。钉到 24（v2 起效的最低 API）后两个布尔值才如实反映块的存在。
+            #    不断言 v1：它只服务 Android ≤6.0，本项目 minSdk 31 ⇒ v1 本就不启用，断言必误报。
+            VERBOSE="$("$APKSIGNER" verify --verbose --min-sdk-version 24 "$APK" 2>&1 || true)"
+            SCHEMES="v2 v3"
+            for scheme in $SCHEMES; do
+              printf '%s' "$VERBOSE" | grep -qE "Verified using ${scheme} scheme.*: true" \
+                || { echo "::error::$NAME 未启用 ${scheme} 签名方案 —— 拒绝发布"; printf '%s\n' "$VERBOSE"; exit 1; }
+            done
+            echo "  ✅ 签名方案含 v2+v3"
+
+            echo "CERT_SHA256=$ACTUAL" >> "$GITHUB_ENV"
+            echo "SIGN_SCHEMES=${SCHEMES// /+}" >> "$GITHUB_ENV"
+          done
+
+      # 发布到固定 tag 的**同一页**。无并发锁下的写入安全靠三点：
+      #   ① 幂等创建：先查后建，撞上 422（另一运行刚建好）就重查 —— 不再有「同时创建」的竞态；
+      #   ② 资产名含 时间戳 + 短 SHA ⇒ 天然唯一，并发上传互不覆盖；--clobber 让重跑覆盖自己；
+      #   ③ 正文**不由本步写**（见 Refresh），故不存在「正文互相覆盖」。
+      # ⚠️ **不要给 asset 写 label**：GitHub 在 Release 页面用 label **顶替文件名显示**，打了
+      #    label 的包会整行变成 label，看着就像「产物名不对」。
+      - name: Publish to ci release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+          REL_NAME: ${{ steps.target.outputs.name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 页面不存在则建（正文是占位，真正的正文由 Refresh 重建）
+          : > /tmp/empty-notes.md
+          for i in 1 2 3 4 5; do
+            gh release view "$TARGET_TAG" >/dev/null 2>&1 && break
+            gh release create "$TARGET_TAG" \
+              --title "$REL_NAME" --prerelease --latest=false \
+              --notes-file /tmp/empty-notes.md >/dev/null 2>&1 || true
+          done
+          gh release view "$TARGET_TAG" >/dev/null 2>&1 \
+            || { echo "::error::$TARGET_TAG 页不存在且创建失败"; exit 1; }
+
+          gh release upload "$TARGET_TAG" dist/*.apk --clobber >/dev/null
+          echo "已上传：$(ls dist/*.apk | tr '\n' ' ')"
+
+          # 清历史遗留 label（曾一度打过，会把文件名顶掉）：只挑 label 非空的动手，
+          #   正常状态下零 PATCH。幂等，并发重复清同一份无害。
+          gh api --paginate -H "Accept: application/vnd.github+json" \
+            "repos/${REPO}/releases/tags/${TARGET_TAG}" \
+            --jq '.assets[] | select((.label // "") != "") | (.id | tostring)' \
+          | while read -r id; do
+              [ -n "$id" ] || continue
+              gh api -X PATCH -H "Accept: application/vnd.github+json" \
+                "repos/${REPO}/releases/assets/${id}" -f label="" >/dev/null 2>&1 || true
+            done
+
+      # ⚠️ artifact 名必须带 run_number：upload-artifact 拒绝同名 artifact（不是覆盖），而
+      #    「同一 commit、同一分钟内重复触发」会让 ts 与短号都相同 ⇒ 直接失败。
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PREFIX }}-${{ steps.target.outputs.variant_tag }}-${{ steps.info.outputs.ts }}-${{ steps.info.outputs.short }}-${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      # 正文重建 + 清理，**共用同一份 API 快照** ⇒「表格里列出的组」与「实际保留的组」必然一致。
+      # 正文为什么**全量重建**而不是在旧正文上追加：重建的输入是页面上真实存在的 asset 列表
+      #   （权威、各 run 共享），并发交错下任何一次运行的产出都是「当时可见的完整状态」，最终
+      #   收敛；追加式则会在「两个 run 同时读到同一份旧正文」时各写各的、丢掉对方那一行。
+      - name: Refresh ci page body + cleanup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+          chmod +x "$REFRESH_SCRIPT"
+          # 富脚注由 workflow 拼（页面语义因项目而异）；脚本自带的部分见其 FOOTER_EXTRA 说明。
+          FOOTER_EXTRA="$(
+            echo "- 各包共用同一把固定钥（${SIGN_SCHEMES:-未读取到}），可互相覆盖安装。"
+            echo "- debug 包调试日志最全（由 \`BuildConfig.DEBUG\` 在编译期决定），排障优先用它；release 包与正式版同构建类型（R8 已裁剪），可用来验证 minify/keep 规则。"
+            echo "- 产物为单 ABI \`${EXPECT_ABI}\`（abi splits，非通用包）：装包前确认设备架构；mihomo 核心 \`libmihomo.so\` 由 CI 现编（Go + NDK），不随仓库分发。"
+          )" \
+          "$REFRESH_SCRIPT"
+# 收尾提示（不上传到页面，只写在这里供新项目参考）：
+#   · 首次接入后手动 dispatch 一次（variant=both），确认页面出两行、资产各一份。
+#   · 页面列集与列序改 COLUMNS（默认 time,version,commit,variant,size,download）。
+#   · 保留组数改 KEEP_GROUPS；改小会让旧包在下次运行时被清理。
