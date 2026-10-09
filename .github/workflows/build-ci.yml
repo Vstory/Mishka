@@ -388,7 +388,10 @@ jobs:
             done
             echo "  ✅ 核心 so 齐全"
 
-            # ④ 版本号必须与源码一致：CI 渠道额外带 `+ci-<变体>.<短号>` 构建元数据段
+            # ④ 版本号必须与源码一致：CI 渠道额外带 `+ci-<变体>.<短号>` 构建元数据段。
+            #    后缀必须与 Gradle build 步骤传给构建的 -PciVersionSuffix 逐字一致，两处同源不同步
+            #    就会让「版本号漂移」这条断言永远红。
+            EXPECT_VN="${VER}+ci-${VAR}.${SHORT}"
             printf '%s' "$PKG_LINE" | grep -q "versionCode='${CODE}'" \
               || { echo "::error::$NAME 的 versionCode 与源码不符（期望 ${CODE}）：$PKG_LINE"; exit 1; }
             # 用 -F：期望串含 `+` 与 `.`，走正则会被当元字符
