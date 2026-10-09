@@ -4,7 +4,7 @@
 #   ⚠️ 本项目（Mishka = mihomo GUI，**非 LSPosed 模块**）对母版有四处裁剪，同步母版更新时注意保留：
 #     ① 构建环境：多了 Go 工具链 + 子模块（mihomo / scripta）+ 先跑 downloadGeoFiles
 #     ② 版本号解析：versionName 在 buildSrc 常量里、versionCode 是 git 提交数（不是 versionName= 字面量）
-#     ③ 产物门禁：去掉 libxposed 三件套那几条，改查包名 / ABI / 核心 so / 签名
+#     ③ 产物门禁：去掉 libxposed 三件套那几条，改查包名 / ABI / 核心 so / IP 地理数据 / 签名
 #     ④ 产物定位：`base.archivesName` 把 APK 名定成 `Mishka-v<版本>(<code>)-<abi>-<变体>.apk`（随版本与
 #        提交数变化）⇒ 母版钉死的产物路径在此必然落空，改按变体目录 glob 取并要求恰好一个
 # ══════════════════════════════════════════════════════════════════════════════
@@ -389,6 +389,18 @@ jobs:
                 || { echo "::error::$NAME 缺 lib/${EXPECT_ABI}/${so}（核心库没打进包）"; exit 1; }
             done
             echo "  ✅ 核心 so 齐全"
+
+            # ③b IP 地理数据三件套必须在包里。与 ③ 同类的静默失败：`downloadGeoFiles` 刻意不在
+            #     assemble 依赖链上（要联网），工作流里那一行被删掉时构建照样全绿，只是运行时
+            #     GeoIP/GeoSite 规则失效。512KB 下限与 app/build.gradle.kts 的 MIN_FILE_BYTES
+            #     同源（拦 404 / 限流返回的 HTML 被原样写成数据文件）。
+            for asset in geoip.metadb geosite.dat ASN.mmdb; do
+              ASIZE="$(unzip -l "$APK" | awk -v p="assets/$asset" '$4 == p { print $1; exit }')"
+              [ -n "$ASIZE" ] || { echo "::error::$NAME 缺 assets/$asset（downloadGeoFiles 没跑，或没打进包）"; exit 1; }
+              [ "$ASIZE" -ge 524288 ] \
+                || { echo "::error::$NAME 的 assets/$asset 只有 $ASIZE 字节 —— 疑似错误页"; exit 1; }
+            done
+            echo "  ✅ IP 地理数据齐全（geoip.metadb / geosite.dat / ASN.mmdb）"
 
             # ④ 版本号必须与源码一致：CI 渠道额外带 `+ci-<变体>.<短号>` 构建元数据段。
             #    后缀必须与 Gradle build 步骤传给构建的 -PciVersionSuffix 逐字一致，两处同源不同步
