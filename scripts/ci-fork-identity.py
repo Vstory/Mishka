@@ -2,8 +2,9 @@
 """CI 专用：把 runner 工作区改写成 fork 身份，仓库里的源码一行都不落库。
 
 fork 包与上游原版要能**同时安装、同时运行**，两边用到的一切全局命名空间都必须错开 ——
-包名、显示名、TUN 设备名、iptables chain 名与 xt_comment 标签、fwmark / route table /
-ip rule 优先级、TPROXY 与 DNS 端口、按名字匹配进程的 pgrep/pkill 模式。
+包名、显示名（含 Gradle 产物名前缀 archivesName）、TUN 设备名、iptables chain 名与
+xt_comment 标签、fwmark / route table / ip rule 优先级、TPROXY 与 DNS 端口、按名字匹配
+进程的 pgrep/pkill 模式。
 
 漏改任何一项都**不会**编译失败，只会在两个包同时跑时静默互相拆台。最典型的一条：
 `RootTproxyApplier.teardown()` / `RootTetherHijacker.teardown()` 按 chain 名与标签清规则，
@@ -21,11 +22,13 @@ ip rule 优先级、TPROXY 与 DNS 端口、按名字匹配进程的 pgrep/pkill
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KOTLIN_DIR = "app/src/main/kotlin/top/yukonga/mishka"
+BUILDSRC_DIR = "buildSrc/src/main/kotlin"
 SERVICE = f"{KOTLIN_DIR}/service"
 PLATFORM = f"{KOTLIN_DIR}/platform"
 
@@ -68,6 +71,15 @@ def build_edits(app_id: str, label: str) -> list[tuple[str, str, str, int | None
             "app/src/main/res/values/strings.xml",
             '<string name="app_name" translatable="false">Mishka</string>',
             f'<string name="app_name" translatable="false">{label}</string>',
+            1,
+        ),
+        # Gradle 侧原始产物名（app/build/outputs/.../Mishka.F-v1.0.0(225)-arm64-v8a-release.apk）：
+        #   CI 发布名由 workflow 单独拼，这里只管构建日志与本地产物目录里露出的名字 —— 留 `Mishka`
+        #   会让人以为编的是上游包。APP_NAME 全仓仅此一处被引用（app/build.gradle.kts 的 archivesName）。
+        (
+            f"{BUILDSRC_DIR}/ProjectConfig.kt",
+            'const val APP_NAME = "Mishka"',
+            f'const val APP_NAME = "{label}"',
             1,
         ),
         # ── TUN 设备名：root TUN 模式两个实例抢同名接口，清理时 ip link delete 会删掉对方的 ──
@@ -426,17 +438,18 @@ FORBIDDEN = [
     "1053",
     'ROOT_TUN_DEVICE, "Mishka"',
     'DEFAULT_TUN_DEVICE = "Mishka"',
+    'APP_NAME = "Mishka"',
 ]
 
 
 def scan_forbidden() -> list[str]:
     hits: list[str] = []
-    root = REPO_ROOT / KOTLIN_DIR
-    for path in sorted(root.rglob("*.kt")):
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            for needle in FORBIDDEN:
-                if needle in line:
-                    hits.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {needle}")
+    for root in (KOTLIN_DIR, BUILDSRC_DIR):
+        for path in sorted((REPO_ROOT / root).rglob("*.kt")):
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                for needle in FORBIDDEN:
+                    if needle in line:
+                        hits.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {needle}")
     return hits
 
 
@@ -446,6 +459,15 @@ def main() -> int:
     parser.add_argument("--label", default=DEFAULT_LABEL)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    # label 不只进 app_name：它还当前缀进 APK 文件名与下载 URL（workflow 的产物名、Gradle 的
+    #   archivesName）⇒ 生成名里的非法字符在这里拦下，别等 URL 或命名自检报错。
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", args.label):
+        print(
+            f"::error::--label 只允许 A-Za-z0-9._-（它进 APK 文件名与下载 URL）：{args.label!r}",
+            file=sys.stderr,
+        )
+        return 1
 
     edits = build_edits(args.app_id, args.label)
     problems: list[str] = []

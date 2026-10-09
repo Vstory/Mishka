@@ -10,6 +10,8 @@
 #     ⑤ fork 身份：CI 出包用 **fork 包名 / 显示名 + fork 专属的内核态命名空间**（与上游原版并存
 #        安装、甚至同时开 root 模式，便于对照同一版本），构建前就地改写工作区，仓库源码保持与
 #        上游逐字一致 —— 见「Apply fork identity」步骤与 scripts/ci-fork-identity.py
+#     ⑥ 产物名前缀：**不设母版的 PREFIX 常量**，直接用 FORK_LABEL（fork 显示名）—— 前缀与身份
+#        改写、门禁同源，改 label 一处即全变（见 Resolve APK name / Upload artifact / Refresh）
 # ══════════════════════════════════════════════════════════════════════════════
 name: Build · CI
 
@@ -49,9 +51,9 @@ permissions:
 
 env:
   # ════════════════════════ PROJECT-CUSTOM-BEGIN ════════════════════════
-  # 产物名前缀 = 应用英文名（与包名末段一致）。进文件名与下载 URL ⇒ 只允许 A-Za-z0-9._-
-  #   （中文应用名进不了文件名/URL；括号在 URL 里需转义，一律用 `-`/`.`，名里不得出现括号）
-  PREFIX: Mishka
+  # 产物名前缀**不另设常量**：直接取下面的 FORK_LABEL（fork 显示名）⇒ 前缀 / 显示名 / 门禁同源，
+  #   改 label 一处即全变。名字进文件名与下载 URL ⇒ label 只允许 A-Za-z0-9._-（中文名与括号在此
+  #   会变成 URL 不友好字符），ci-fork-identity.py 对 --label 有断言。
   # 版本号来源文件：Mishka 的 versionName 是 buildSrc 里的常量（sed 取第一处 VERSION_NAME），
   # versionCode 由 git 提交数生成 ⇒ 解析方式见 Resolve APK name 步骤
   VERSION_FILE: buildSrc/src/main/kotlin/ProjectConfig.kt
@@ -213,9 +215,8 @@ jobs:
       #
       # 命名：<前缀>_<版本>.<code>_<时间>_ci-<变体>_<短号>.apk
       #   · 渠道段 `ci-debug` / `ci-release`：下载到手一眼看出不是正式包。
-      #   · 前缀与包名一致（应用名是中文，进不了文件名/URL）。
-      #   · ⚠️ 前缀两处同源，改名必须同改：本处与发版工作流的 PREFIX
-      #       —— 两处不一致会让同一版本的两个渠道产物名不同源，混在一起分不清。
+      #   · 前缀 = fork 显示名（FORK_LABEL）⇒ 产物名自带 fork 标识，与上游原版的包一眼可分。
+      #     刻意不另设 PREFIX 常量：与身份改写、门禁三处同源，改 label 一处即可，不会各说各话。
       - name: Resolve APK name
         id: target
         env:
@@ -256,7 +257,7 @@ jobs:
           for kv in "VER=$VER" "CODE=$CODE" "VARIANT_LIST=$VLIST" "SHORT=$SHORT"; do echo "${kv}" >> "$GITHUB_ENV"; done
 
           for v in $VLIST; do
-            N="${PREFIX}_${VER}.${CODE}_${TS}_ci-${v}_${SHORT}.apk"
+            N="${FORK_LABEL}_${VER}.${CODE}_${TS}_ci-${v}_${SHORT}.apk"
             echo "APKNAME_$(printf '%s' "$v" | tr '[:lower:]' '[:upper:]')=${N}" >> "$GITHUB_ENV"
             echo "产物名（${v}）：${N}"
           done
@@ -360,8 +361,15 @@ jobs:
           want=$(wc -w <<< "$VARIANT_LIST")
           [ "${#apks[@]}" -eq "$want" ] || { echo "::error::应产出 $want 个包，实际 ${#apks[@]} 个"; exit 1; }
           for f in "${apks[@]}"; do
-            printf '%s' "$(basename "$f")" | grep -qE "$RE" \
-              || { echo "::error::产物名与规则不符（或含空格/括号/百分号等 URL 不友好字符）: $(basename "$f")"; exit 1; }
+            B="$(basename "$f")"
+            printf '%s' "$B" | grep -qE "$RE" \
+              || { echo "::error::产物名与规则不符（或含空格/括号/百分号等 URL 不友好字符）: $B"; exit 1; }
+            # 前缀必须是 fork 显示名：产物名是与上游包区分的唯一线索（两个包同名时人眼分不出来），
+            #   前缀漂回 `Mishka` 属于静默退化 ⇒ 钉住。
+            case "$B" in
+              "${FORK_LABEL}_"*) ;;
+              *) echo "::error::产物名前缀不是 ${FORK_LABEL}: $B"; exit 1 ;;
+            esac
           done
           echo "✅ 命名自检通过"
           ls -la dist
@@ -541,7 +549,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ env.PREFIX }}-${{ steps.target.outputs.variant_tag }}-${{ steps.info.outputs.ts }}-${{ steps.info.outputs.short }}-${{ github.run_number }}
+          name: ${{ env.FORK_LABEL }}-${{ steps.target.outputs.variant_tag }}-${{ steps.info.outputs.ts }}-${{ steps.info.outputs.short }}-${{ github.run_number }}
           path: dist/*.apk
           if-no-files-found: error
 
@@ -555,6 +563,8 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           SERVER: ${{ github.server_url }}
+          # 刷新器只拿它写脚注（「前缀 = …」），是 env.PREFIX 那份常量的替代来源
+          PREFIX: ${{ env.FORK_LABEL }}
         run: |
           set -euo pipefail
           chmod +x "$REFRESH_SCRIPT"

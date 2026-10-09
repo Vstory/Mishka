@@ -83,8 +83,9 @@ git submodule update --init --recursive
 
 任意分支 push 都会触发 `Build · CI`（[.github/workflows/build-ci.yml](.github/workflows/build-ci.yml)），产物发到固定的 [`ci` 滚动页](https://github.com/Vstory/Mishka/releases/tag/ci)——只留最近 6 组构建、页面地址永久固定：
 
-- 产物名 `Mishka_<版本>.<code>_<时间>_ci-<变体>_<短号>.apk`：`<时间>` 为北京时间，`<短号>` 是提交 SHA 前 8 位。
-- push 默认只出 `debug`；要 `release`（R8 裁剪后的形态）时手动 dispatch 并选变体 `both`。
+- 产物名 `Mishka.F_<版本>.<code>_<时间>_ci-<变体>_<短号>.apk`：前缀是 fork 显示名，`<时间>` 为北京时间，`<短号>` 是提交 SHA 前 8 位。
+- CI 出的是 **fork 包**（`top.yukonga.mishka.fork` / 显示名 `Mishka.F`）：与上游原版并存安装、也可同时开启，构建期改写工作区，仓库源码保持与上游一致。
+- push 默认出 `debug` + `release` 两个变体；要只出其中一个时手动 dispatch 并选变体。
 - 只出 `arm64-v8a` 单 ABI（abi splits），装包前确认设备架构。
 - 跑的就是上面这几步：子模块 → `downloadGeoFiles` → Go 核心 → `assemble<变体>`；两个变体共用同一把密钥，可互相覆盖安装。
 
