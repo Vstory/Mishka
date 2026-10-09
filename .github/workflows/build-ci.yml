@@ -7,9 +7,10 @@
 #     ③ 产物门禁：去掉 libxposed 三件套那几条，改查包名+显示名+启动类 / ABI / 核心 so / IP 地理数据 / 签名
 #     ④ 产物定位：`base.archivesName` 把 APK 名定成 `Mishka-v<版本>(<code>)-<abi>-<变体>.apk`（随版本与
 #        提交数变化）⇒ 母版钉死的产物路径在此必然落空，改按变体目录 glob 取并要求恰好一个
-#     ⑤ fork 身份：CI 出包用 **fork 包名 / 显示名 + fork 专属的内核态命名空间**（与上游原版并存
-#        安装、甚至同时开 root 模式，便于对照同一版本），构建前就地改写工作区，仓库源码保持与
-#        上游逐字一致 —— 见「Apply fork identity」步骤与 scripts/ci-fork-identity.py
+#     ⑤ fork 身份：CI 出包用 **fork 包名 / 显示名 + fork 专属的内核态命名空间 + 独立的 WebDAV
+#        备份目录**（与上游原版并存安装、甚至同时开 root 模式，便于对照同一版本），构建前就地
+#        改写工作区，仓库源码保持与上游逐字一致 —— 见「Apply fork identity」步骤与
+#        scripts/ci-fork-identity.py
 #     ⑥ 产物名前缀：**不设母版的 PREFIX 常量**，直接用 FORK_LABEL（fork 显示名）—— 前缀与身份
 #        改写、门禁同源，改 label 一处即全变（见 Resolve APK name / Upload artifact / Refresh）
 # ══════════════════════════════════════════════════════════════════════════════
@@ -114,7 +115,8 @@ jobs:
 
       # CI 出包的身份与上游原版彻底错开：包名 / 显示名 / root 模式的内核态命名空间（TUN 设备名、
       #   iptables chain 名与 xt_comment 标签、fwmark / route table / ip rule 优先级、TPROXY 与
-      #   DNS 端口、pgrep / pkill 匹配模式）。两者可同时安装、**甚至同时开 root 模式**对照同一版本。
+      #   DNS 端口、pgrep / pkill 匹配模式）/ WebDAV 备份目录（两个包通常配同一个远端账号，目录名
+      #   固定就会互相覆盖备份）。两者可同时安装、**甚至同时开 root 模式**对照同一版本。
       #   **只改写 runner 工作区**，仓库源码保持与上游逐字一致 —— 包名一旦落进仓库，每次 rebase
       #   上游都要撞冲突。逐项清单与「为什么必须错开」见 scripts/ci-fork-identity.py。
       #   ⚠️ 改的是 applicationId（最终包名），**不动 namespace**：R 类、资源引用、类的全限定名

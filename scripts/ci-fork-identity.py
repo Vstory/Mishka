@@ -4,7 +4,7 @@
 fork 包与上游原版要能**同时安装、同时运行**，两边用到的一切全局命名空间都必须错开 ——
 包名、显示名（含 Gradle 产物名前缀 archivesName）、TUN 设备名、iptables chain 名与
 xt_comment 标签、fwmark / route table / ip rule 优先级、TPROXY 与 DNS 端口、按名字匹配
-进程的 pgrep/pkill 模式。
+进程的 pgrep/pkill 模式、WebDAV 备份目录（远端同一账号下的固定落盘路径）。
 
 漏改任何一项都**不会**编译失败，只会在两个包同时跑时静默互相拆台。最典型的一条：
 `RootTproxyApplier.teardown()` / `RootTetherHijacker.teardown()` 按 chain 名与标签清规则，
@@ -80,6 +80,14 @@ def build_edits(app_id: str, label: str) -> list[tuple[str, str, str, int | None
             f"{BUILDSRC_DIR}/ProjectConfig.kt",
             'const val APP_NAME = "Mishka"',
             f'const val APP_NAME = "{label}"',
+            1,
+        ),
+        # ── WebDAV 备份目录：远端账号通常是同一个（用户不会为 fork 另开一份），目录名又固定、
+        #    文件名也固定 ⇒ 两个包互相覆盖对方的备份，恢复时拿到的是另一个包导出的配置 ──
+        (
+            f"{KOTLIN_DIR}/data/backup/WebDavClient.kt",
+            'const val BACKUP_DIR = "Mishka"',
+            f'const val BACKUP_DIR = "{label}"',
             1,
         ),
         # ── TUN 设备名：root TUN 模式两个实例抢同名接口，清理时 ip link delete 会删掉对方的 ──
@@ -439,6 +447,7 @@ FORBIDDEN = [
     'ROOT_TUN_DEVICE, "Mishka"',
     'DEFAULT_TUN_DEVICE = "Mishka"',
     'APP_NAME = "Mishka"',
+    'BACKUP_DIR = "Mishka"',
 ]
 
 
