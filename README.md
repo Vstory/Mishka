@@ -53,7 +53,7 @@
 
 - JDK 21
 - Android SDK + NDK（含 clang），SDK 版本见 `buildSrc/ProjectConfig.kt`
-- Go（版本见 `mihomo/go.mod`）
+- Go（版本见 `app/src/main/native/mishka_core/go.mod`；mihomo 子模块经 go.mod `replace` 引入）
 - Git（用于 submodule 与版本号生成）
 
 ### 步骤
@@ -78,6 +78,15 @@ git submodule update --init --recursive
 ```
 
 > `mihomo` 通过 git submodule 引入 [YuKongA/mihomo](https://github.com/YuKongA/mihomo) 的 `Mishka` 分支（含 5 个针对 Android fd/TUN 的 patch）。Gradle 会自动驱动 Go 交叉编译，产物位于 `app/src/main/jniLibs/<ABI>/`
+
+### CI 出包
+
+任意分支 push 都会触发 `Build · CI`（[.github/workflows/build-ci.yml](.github/workflows/build-ci.yml)），产物发到固定的 [`ci` 滚动页](https://github.com/Vstory/Mishka/releases/tag/ci)——只留最近 6 组构建、页面地址永久固定：
+
+- 产物名 `Mishka_<版本>.<code>_<时间>_ci-<变体>_<短号>.apk`：`<时间>` 为北京时间，`<短号>` 是提交 SHA 前 8 位。
+- push 默认只出 `debug`；要 `release`（R8 裁剪后的形态）时手动 dispatch 并选变体 `both`。
+- 只出 `arm64-v8a` 单 ABI（abi splits），装包前确认设备架构。
+- 跑的就是上面这几步：子模块 → `downloadGeoFiles` → Go 核心 → `assemble<变体>`；两个变体共用同一把密钥，可互相覆盖安装。
 
 ## 致谢
 
